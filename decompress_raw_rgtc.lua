@@ -6,20 +6,44 @@ local RGTC = require("./modules/RGTC.lua")
 local Bitmap = require("./modules/Bitmap.lua")
 
  -- Only invoke if you have the raw, decoded buffers. It assumes AGBR byte order.
-function BlendMipmaps(grayscale, normalmap, w, h)
+function BlendMipmaps(grayscale, component, w, h)
     assert(grayscale and type(grayscale)=='table' and (grayscale.length%4 == 0))
-    assert(normalmap and type(normalmap)=='table' and (normalmap.length%4 == 0))
-    assert(normalmap.length == w*h)
+    assert(component and type(component)=='table' and (component.length%4 == 0))
+    assert(component.length == w*h)
     assert(grayscale.length == w*h*4)
     
-    local function CalcLinearLight(n, t)
-        n = (n/255.0)
-        t = (t/255.0)
-        local final = math.floor((t + 2*n-1) * 255)
-        if final < 0 then final = 0
-        elseif final > 255 then final = 255
-        end
-        return final
+    local function ClampDoubleToByte(c, scale, minC, maxC)
+        scale = scale or 255
+        minC = minC or 0
+        maxC = maxC or 255
+        c = math.floor(c * scale)
+        if     c < minC then c = 0
+        elseif c > maxC then c = 255 end
+        return c
+    end
+    
+    -- Reference: http://www.equasys.de/colorconversion.html
+    -- Luminance; Chroma: Blue; Chroma: Red
+    local coeffs = { -- YPbPr to RGB
+        SD = { -- Standard Definition
+            R = {1.000,  0.000,  1.402},
+            G = {1.000, -0.344, -0.714},
+            B = {1.000,  1.772,  0.000}},
+        HD = { -- High Definition
+            R = {1.0000,  0.0000,  1.5748},
+            G = {1.0000, -0.1873, -0.4681},
+            B = {1.0000,  1.8556,  0.0000}}
+    }
+
+    local function Convert_8bitYCbCr_to_8bitRGB(ypb, cbb, crb)
+        local ypn = (ypb/255)
+        local cbn = (cbb/255) - 0.5
+        local crn = (crb/255) - 0.5
+        
+        local r = ClampDoubleToByte((coeffs.HD.R[1] * ypn) + (coeffs.HD.R[2] * cbn) + (coeffs.HD.R[3] * crn))
+        local g = ClampDoubleToByte((coeffs.HD.G[1] * ypn) + (coeffs.HD.G[2] * cbn) + (coeffs.HD.G[3] * crn))
+        local b = ClampDoubleToByte((coeffs.HD.B[1] * ypn) + (coeffs.HD.B[2] * cbn) + (coeffs.HD.B[3] * crn))
+        return r, g, b
     end
     
     print("Now attempting to calculate the original image...")
@@ -29,9 +53,12 @@ function BlendMipmaps(grayscale, normalmap, w, h)
             local norm_pix = bbp * ((y*(w/2)) + x)
             for t=0, (4)-1 do
                 local scale_pix = bbp * (y*(w*2) + x*2 + math.floor(t/2) + (t%2) + ((w-1) * math.floor(t/2)))
-                grayscale[1+scale_pix + 3] = CalcLinearLight(normalmap[1+norm_pix+3], grayscale[1+scale_pix + 3]) -- Red
-                grayscale[1+scale_pix + 2] = CalcLinearLight(normalmap[1+norm_pix+2], grayscale[1+scale_pix + 2]) -- Green
-                grayscale[1+scale_pix + 1] = CalcLinearLight(normalmap[1+norm_pix+1], grayscale[1+scale_pix + 1]) -- Blue
+                local Yb = grayscale[1+scale_pix + 1] -- Luminance (grayscale)
+                local Bn = component[1+norm_pix  + 2] -- Normal byte chroma "Blue"
+                local Rn = component[1+norm_pix  + 3] -- Normal byte chroma "Red"
+                grayscale[1+scale_pix + 3],
+                grayscale[1+scale_pix + 2],
+                grayscale[1+scale_pix + 1] = Convert_8bitYCbCr_to_8bitRGB(Yb, Bn, Rn)
             end
         end
     end
@@ -45,25 +72,30 @@ end
 -----------------------------------------
 CURRENT_DIR = Path.resolve("")
 
-GrayScaleInput  = CURRENT_DIR .. '\\mip1.bin'
-GrayScaleOutput = CURRENT_DIR .. '\\grayscale.bmp'
-NormalMapInput  = CURRENT_DIR .. '\\mip2.bin'
-NormalMapOutput = CURRENT_DIR .. '\\normal.bmp'
-OrigImageOutput = CURRENT_DIR .. '\\calculated_final.bmp'
+-- I named the raw texture data accordingly, yours may differ. I just didn't want to
+-- keep re-writing the sizes and file names everywhere.
+local prefix = '' -- 'img01_'
+local f_width, f_height = 512, 256
+
+GrayScaleInput  = CURRENT_DIR .. '\\' .. prefix .. 'mip1_' .. tostring(f_width) .. '_' .. tostring(f_height) .. '.bin'
+ComponentInput  = CURRENT_DIR .. '\\' .. prefix .. 'mip2_' .. tostring(f_width/2) .. '_' .. tostring(f_height/2) .. '.bin'
+GrayScaleOutput = CURRENT_DIR .. '\\' .. prefix .. 'grayscale.bmp'
+ComponentOutput = CURRENT_DIR .. '\\' .. prefix .. 'components.bmp'
+OrigImageOutput = CURRENT_DIR .. '\\' .. prefix .. 'calculated_final.bmp'
 
 assert(FileSystem.existsSync(GrayScaleInput, "Input grayscale texture doesn't exist!!"))
-assert(FileSystem.existsSync(NormalMapInput, "Input normal map texture doesn't exist!!"))
+assert(FileSystem.existsSync(ComponentInput, "Input components texture doesn't exist!!"))
 
 local grayscale = Buffer:new(FileSystem.readFileSync(GrayScaleInput))
-local normalmap = Buffer:new(FileSystem.readFileSync(NormalMapInput))
+local component = Buffer:new(FileSystem.readFileSync(ComponentInput))
 
-grayscale = RGTC:decompressRGTC2_to_RGBA(grayscale, 512, 256, {'Y','Y','Y','X'})
-normalmap = RGTC:decompressRGTC2_to_RGBA(normalmap, 256, 128, {'X','Z','Y',0xFF})
-Bitmap:save(GrayScaleOutput, grayscale, 512, 256)
-Bitmap:save(NormalMapOutput, normalmap, 256, 128)
+grayscale = RGTC:decompressRGTC2_to_RGBA(grayscale, f_width, f_height, {'Y','Y','Y','X'})
+component = RGTC:decompressRGTC2_to_RGBA(component, (f_width/2), (f_height/2), {'X','Y',0x00,0xFF})
+Bitmap:save(GrayScaleOutput, grayscale, f_width, f_height)
+Bitmap:save(ComponentOutput, component, (f_width/2), (f_height/2))
 
-local original = BlendMipmaps(grayscale, normalmap, 512, 256)
+local original = BlendMipmaps(grayscale, component, f_width, f_height)
 print("Saving the buffer to a bitmap...")
-Bitmap:save(OrigImageOutput, original, 512, 256)
+Bitmap:save(OrigImageOutput, original, f_width, f_height)
 print("Remember to inspect the output and dump file!\n")
 
